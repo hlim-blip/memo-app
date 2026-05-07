@@ -50,9 +50,11 @@
     transition: background 0.2s, color 0.2s;
   }
   .container { max-width: 640px; margin: 0 auto; }
-  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; gap: 8px; }
+  .header-actions { display: flex; align-items: center; gap: 8px; }
   h1 { font-size: 24px; }
-  .theme-toggle {
+  .user-info { font-size: 13px; color: var(--text-meta); }
+  .theme-toggle, .auth-btn {
     background: var(--card);
     border: 1px solid var(--border);
     border-radius: 50%;
@@ -65,7 +67,7 @@
     justify-content: center;
     transition: background 0.2s, border-color 0.2s;
   }
-  .theme-toggle:hover { background: var(--secondary-bg); }
+  .theme-toggle:hover, .auth-btn:hover { background: var(--secondary-bg); }
   .editor {
     background: var(--card);
     border-radius: 10px;
@@ -98,6 +100,7 @@
   }
   .btn-primary { background: var(--accent); color: #fff; }
   .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
   .btn-secondary { background: var(--secondary-bg); color: var(--secondary-text); }
   .btn-secondary:hover { background: var(--secondary-bg-hover); }
   .btn-danger { background: var(--card); color: var(--danger-text); border: 1px solid var(--danger-border); }
@@ -114,29 +117,63 @@
   .memo-meta { font-size: 12px; color: var(--text-meta); margin-bottom: 10px; }
   .memo-actions { display: flex; gap: 8px; }
   .empty { text-align: center; color: var(--text-empty); padding: 40px 0; font-size: 14px; }
+  .signin-card {
+    background: var(--card);
+    border-radius: 10px;
+    padding: 32px;
+    box-shadow: var(--shadow);
+    text-align: center;
+  }
+  .signin-card p { margin-bottom: 16px; color: var(--text-muted); font-size: 14px; }
+  .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <div class="container">
   <div class="header">
     <h1>📝 메모장</h1>
-    <button id="themeToggle" class="theme-toggle" aria-label="테마 전환" title="테마 전환">🌙</button>
-  </div>
-
-  <div class="editor">
-    <input id="title" type="text" placeholder="제목" maxlength="100">
-    <textarea id="body" placeholder="내용을 입력하세요..."></textarea>
-    <div class="actions">
-      <button id="cancelBtn" class="btn-secondary" style="display:none;">취소</button>
-      <button id="saveBtn" class="btn-primary">저장</button>
+    <div class="header-actions">
+      <span id="userInfo" class="user-info"></span>
+      <button id="themeToggle" class="theme-toggle" aria-label="테마 전환" title="테마 전환">🌙</button>
+      <button id="authBtn" class="auth-btn" aria-label="로그인" title="로그인">👤</button>
     </div>
   </div>
 
-  <div id="list"></div>
+  <div id="signinCard" class="signin-card hidden">
+    <p>메모를 사용하려면 Google 계정으로 로그인하세요.</p>
+    <button id="signinBtn" class="btn-primary">Google로 로그인</button>
+  </div>
+
+  <div id="appView" class="hidden">
+    <div class="editor">
+      <input id="title" type="text" placeholder="제목" maxlength="100">
+      <textarea id="body" placeholder="내용을 입력하세요..."></textarea>
+      <div class="actions">
+        <button id="cancelBtn" class="btn-secondary" style="display:none;">취소</button>
+        <button id="saveBtn" class="btn-primary">저장</button>
+      </div>
+    </div>
+
+    <div id="list"></div>
+  </div>
 </div>
 
-<script>
-const STORAGE_KEY = "memos.v1";
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+import {
+  getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
+import {
+  getFirestore, collection, query, where, orderBy, onSnapshot,
+  addDoc, updateDoc, deleteDoc, doc, serverTimestamp
+} from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+import { firebaseConfig } from "./firebase-config.js";
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const provider = new GoogleAuthProvider();
+
 const THEME_KEY = "memos.theme";
 const $title = document.getElementById("title");
 const $body = document.getElementById("body");
@@ -144,6 +181,11 @@ const $saveBtn = document.getElementById("saveBtn");
 const $cancelBtn = document.getElementById("cancelBtn");
 const $list = document.getElementById("list");
 const $themeToggle = document.getElementById("themeToggle");
+const $authBtn = document.getElementById("authBtn");
+const $signinBtn = document.getElementById("signinBtn");
+const $signinCard = document.getElementById("signinCard");
+const $appView = document.getElementById("appView");
+const $userInfo = document.getElementById("userInfo");
 
 function applyTheme(theme) {
   document.documentElement.setAttribute("data-theme", theme);
@@ -158,12 +200,10 @@ $themeToggle.addEventListener("click", () => {
   applyTheme(next);
 });
 
-let memos = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+let currentUser = null;
+let memos = [];
 let editingId = null;
-
-function save() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(memos));
-}
+let unsubscribe = null;
 
 function resetEditor() {
   $title.value = "";
@@ -174,13 +214,20 @@ function resetEditor() {
 }
 
 function formatDate(ts) {
-  const d = new Date(ts);
+  const d = ts instanceof Date ? ts : new Date(ts);
   const pad = n => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  return (s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function tsToMillis(t) {
+  if (!t) return 0;
+  if (typeof t === "number") return t;
+  if (typeof t.toMillis === "function") return t.toMillis();
+  return 0;
 }
 
 function render() {
@@ -190,66 +237,146 @@ function render() {
   }
   $list.innerHTML = memos
     .slice()
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map(m => `
-      <div class="memo">
-        <div class="memo-title">${escapeHtml(m.title || "(제목 없음)")}</div>
-        <div class="memo-body">${escapeHtml(m.body)}</div>
-        <div class="memo-meta">${formatDate(m.updatedAt)}${m.updatedAt !== m.createdAt ? " (수정됨)" : ""}</div>
-        <div class="memo-actions">
-          <button class="btn-secondary" onclick="startEdit('${m.id}')">수정</button>
-          <button class="btn-danger" onclick="remove('${m.id}')">삭제</button>
+    .sort((a, b) => tsToMillis(b.updatedAt) - tsToMillis(a.updatedAt))
+    .map(m => {
+      const updated = tsToMillis(m.updatedAt);
+      const created = tsToMillis(m.createdAt);
+      return `
+        <div class="memo">
+          <div class="memo-title">${escapeHtml(m.title || "(제목 없음)")}</div>
+          <div class="memo-body">${escapeHtml(m.body)}</div>
+          <div class="memo-meta">${updated ? formatDate(updated) : "..."}${updated && created && updated !== created ? " (수정됨)" : ""}</div>
+          <div class="memo-actions">
+            <button class="btn-secondary" data-action="edit" data-id="${m.id}">수정</button>
+            <button class="btn-danger" data-action="delete" data-id="${m.id}">삭제</button>
+          </div>
         </div>
-      </div>
-    `).join("");
+      `;
+    }).join("");
 }
+
+$list.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn) return;
+  const id = btn.dataset.id;
+  if (btn.dataset.action === "edit") startEdit(id);
+  else if (btn.dataset.action === "delete") removeMemo(id);
+});
 
 function startEdit(id) {
   const m = memos.find(x => x.id === id);
   if (!m) return;
   editingId = id;
-  $title.value = m.title;
-  $body.value = m.body;
+  $title.value = m.title || "";
+  $body.value = m.body || "";
   $saveBtn.textContent = "수정 완료";
   $cancelBtn.style.display = "inline-block";
   $title.focus();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
-function remove(id) {
+async function removeMemo(id) {
   if (!confirm("이 메모를 삭제할까요?")) return;
-  memos = memos.filter(m => m.id !== id);
-  save();
-  if (editingId === id) resetEditor();
-  render();
+  try {
+    await deleteDoc(doc(db, "memos", id));
+    if (editingId === id) resetEditor();
+  } catch (err) {
+    console.error(err);
+    alert("삭제에 실패했습니다: " + err.message);
+  }
 }
 
-$saveBtn.addEventListener("click", () => {
+$saveBtn.addEventListener("click", async () => {
+  if (!currentUser) return;
   const title = $title.value.trim();
   const body = $body.value.trim();
   if (!title && !body) {
     alert("제목 또는 내용을 입력하세요.");
     return;
   }
-  const now = Date.now();
-  if (editingId) {
-    const m = memos.find(x => x.id === editingId);
-    if (m) { m.title = title; m.body = body; m.updatedAt = now; }
-  } else {
-    memos.push({
-      id: String(now) + Math.random().toString(36).slice(2, 7),
-      title, body,
-      createdAt: now, updatedAt: now,
-    });
+  $saveBtn.disabled = true;
+  try {
+    if (editingId) {
+      await updateDoc(doc(db, "memos", editingId), {
+        title, body, updatedAt: serverTimestamp(),
+      });
+    } else {
+      await addDoc(collection(db, "memos"), {
+        userId: currentUser.uid,
+        title, body,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+    resetEditor();
+  } catch (err) {
+    console.error(err);
+    alert("저장에 실패했습니다: " + err.message);
+  } finally {
+    $saveBtn.disabled = false;
   }
-  save();
-  resetEditor();
-  render();
 });
 
 $cancelBtn.addEventListener("click", resetEditor);
 
-render();
+async function doSignIn() {
+  try {
+    await signInWithPopup(auth, provider);
+  } catch (err) {
+    console.error(err);
+    alert("로그인에 실패했습니다: " + err.message);
+  }
+}
+
+async function doSignOut() {
+  try {
+    await signOut(auth);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+$signinBtn.addEventListener("click", doSignIn);
+$authBtn.addEventListener("click", () => {
+  if (currentUser) {
+    if (confirm("로그아웃 할까요?")) doSignOut();
+  } else {
+    doSignIn();
+  }
+});
+
+function subscribeMemos(uid) {
+  if (unsubscribe) unsubscribe();
+  const q = query(collection(db, "memos"), where("userId", "==", uid));
+  unsubscribe = onSnapshot(q, (snap) => {
+    memos = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    render();
+  }, (err) => {
+    console.error(err);
+    alert("메모를 불러오지 못했습니다: " + err.message);
+  });
+}
+
+onAuthStateChanged(auth, (user) => {
+  currentUser = user;
+  if (user) {
+    $signinCard.classList.add("hidden");
+    $appView.classList.remove("hidden");
+    $userInfo.textContent = user.displayName || user.email || "";
+    $authBtn.textContent = "🚪";
+    $authBtn.title = "로그아웃";
+    subscribeMemos(user.uid);
+  } else {
+    $signinCard.classList.remove("hidden");
+    $appView.classList.add("hidden");
+    $userInfo.textContent = "";
+    $authBtn.textContent = "👤";
+    $authBtn.title = "로그인";
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    memos = [];
+    resetEditor();
+  }
+});
 </script>
 </body>
 </html>
